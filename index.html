@@ -591,6 +591,43 @@
         box-shadow: none;
       }
 
+      .xr-mode-btn {
+        appearance: none;
+        font-family: 'Press Start 2P', monospace;
+        font-size: 9px;
+        letter-spacing: 0.05em;
+        padding: 8px 13px;
+        min-height: 34px;
+        border-radius: 4px;
+        border: 1px solid #ef4444;
+        background: linear-gradient(180deg, #2e2028 0%, #1c161d 100%);
+        color: #f8fafc;
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14), 0 2px 0 #12121a;
+        cursor: pointer;
+        white-space: nowrap;
+        transition: transform 100ms ease, background-color 140ms ease, border-color 140ms ease;
+      }
+
+      .xr-mode-btn:hover {
+        background: linear-gradient(180deg, #3c2632 0%, #251b24 100%);
+        border-color: #f87171;
+      }
+
+      .xr-mode-btn:active {
+        transform: translateY(1px);
+      }
+
+      .xr-mode-btn:focus-visible {
+        outline: 2px solid #facc15;
+        outline-offset: 2px;
+      }
+
+      .xr-mode-btn.is-active {
+        border-color: #4ade80;
+        color: #dcfce7;
+        background: linear-gradient(180deg, #1b3629 0%, #13241c 100%);
+      }
+
       .sr-only {
         position: absolute;
         width: 1px;
@@ -639,7 +676,8 @@
           font-size: 12px;
         }
 
-        .eject-btn {
+        .eject-btn,
+        .xr-mode-btn {
           font-size: 8px;
           padding: 7px 11px;
         }
@@ -741,7 +779,7 @@
           </span>
         </div>
 
-        <div class="deck-actions">
+        <div id="deck-actions" class="deck-actions">
           <a
             id="launch-link"
             class="launch-link"
@@ -1752,6 +1790,132 @@
         };
       }
 
+      // =========================================================================
+      // Pure WebXR 1:1 Physical Scale, Raycast & 3D Cartridge Slotting Kinematics
+      // =========================================================================
+      const VR_WORLD_SCALE = 0.12;
+
+      function computeVrStageOrigin(viewerPos, consoleSlotPos) {
+        const hx = viewerPos && viewerPos[0] !== undefined ? viewerPos[0] : 0;
+        const hy = viewerPos && viewerPos[1] !== undefined ? viewerPos[1] : 1.55;
+        const hz = viewerPos && viewerPos[2] !== undefined ? viewerPos[2] : 0;
+        const targetSlotXrX = hx;
+        const targetSlotXrY = Math.max(0.68, hy - 0.34);
+        const targetFrontDoorXrZ = hz - 0.44;
+        const frontDoorWorldZ = consoleSlotPos[2] + 1.12;
+        return [
+          targetSlotXrX - consoleSlotPos[0] * VR_WORLD_SCALE,
+          targetSlotXrY - consoleSlotPos[1] * VR_WORLD_SCALE,
+          targetFrontDoorXrZ - frontDoorWorldZ * VR_WORLD_SCALE
+        ];
+      }
+
+      function xrPointToSceneWorld(xrPt, stageOrigin) {
+        return [
+          (xrPt[0] - stageOrigin[0]) / VR_WORLD_SCALE,
+          (xrPt[1] - stageOrigin[1]) / VR_WORLD_SCALE,
+          (xrPt[2] - stageOrigin[2]) / VR_WORLD_SCALE
+        ];
+      }
+
+      function intersectRayAabb(rayOrigin, rayDir, minCorner, maxCorner) {
+        let tMin = 0.0;
+        let tMax = 60.0;
+        for (let axis = 0; axis < 3; axis++) {
+          const o = rayOrigin[axis];
+          const d = rayDir[axis];
+          const bMin = minCorner[axis];
+          const bMax = maxCorner[axis];
+          if (Math.abs(d) < 1e-6) {
+            if (o < bMin || o > bMax) return null;
+          } else {
+            let t1 = (bMin - o) / d;
+            let t2 = (bMax - o) / d;
+            if (t1 > t2) {
+              const tmp = t1;
+              t1 = t2;
+              t2 = tmp;
+            }
+            if (t1 > tMin) tMin = t1;
+            if (t2 < tMax) tMax = t2;
+            if (tMin > tMax) return null;
+          }
+        }
+        return tMin >= 0 ? tMin : tMax >= 0 ? 0 : null;
+      }
+
+      function extractVrHandCartridgeEuler(quat) {
+        if (!quat || quat.length < 4) {
+          return [-0.18, 0, 0];
+        }
+        const qx = quat[0];
+        const qy = quat[1];
+        const qz = quat[2];
+        const qw = quat[3];
+        const sinP = Math.max(-1, Math.min(1, 2 * (qw * qx - qz * qy)));
+        const pitch = Math.asin(sinP);
+        const yaw = Math.atan2(2 * (qw * qy + qx * qz), 1 - 2 * (qx * qx + qy * qy));
+        const roll = Math.atan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz));
+        return [
+          Math.max(-Math.PI * 0.62, Math.min(0.45, -0.18 + pitch * 0.85)),
+          Math.max(-0.85, Math.min(0.85, yaw * 0.65)),
+          Math.max(-0.75, Math.min(0.75, roll * 0.65))
+        ];
+      }
+
+      function evaluateVrSlotInteraction(cartCenter, handEuler, consoleSlotPos) {
+        const cx = cartCenter[0];
+        const cy = cartCenter[1];
+        const cz = cartCenter[2];
+        const slotTargetX = consoleSlotPos[0];
+        const slotTargetY = consoleSlotPos[1] + 0.14;
+        const mouthCenterZ = consoleSlotPos[2] + 1.68;
+        const pushEngageZ = consoleSlotPos[2] + 1.12;
+
+        const dx = cx - slotTargetX;
+        const dy = cy - slotTargetY;
+        const zSpanDist = Math.max(0, Math.abs(cz - (consoleSlotPos[2] + 1.42)) - 0.55);
+
+        const doorNormDist = Math.hypot(dx / 1.45, dy / 1.05, zSpanDist / 1.35);
+        const doorOpenAmount = OPEN_DOOR_ANGLE * (1 - smoothstep(0.55, 1.85, doorNormDist));
+
+        const alignNorm = Math.hypot(
+          dx / 0.92,
+          dy / 0.78,
+          Math.max(0, Math.abs(cz - mouthCenterZ) - 0.65) / 1.10
+        );
+        const alignFactor = 1 - smoothstep(0.30, 1.35, alignNorm);
+
+        const baseRotX = handEuler ? handEuler[0] : -0.18;
+        const baseRotY = handEuler ? handEuler[1] : 0;
+        const baseRotZ = handEuler ? handEuler[2] : 0;
+
+        const rotX = baseRotX + (-Math.PI * 0.5 - baseRotX) * alignFactor;
+        const rotY = baseRotY * (1 - alignFactor);
+        const rotZ = baseRotZ * (1 - alignFactor);
+
+        const inXyCapture = Math.abs(dx) <= 0.68 && Math.abs(dy) <= 0.58;
+        const inMouthZone =
+          inXyCapture &&
+          cz >= consoleSlotPos[2] + 0.10 &&
+          cz <= consoleSlotPos[2] + 2.18;
+        const pushedIntoSlot =
+          Math.abs(dx) <= 0.64 &&
+          Math.abs(dy) <= 0.54 &&
+          cz >= consoleSlotPos[2] + 0.05 &&
+          cz <= pushEngageZ;
+
+        return {
+          doorOpenAmount: doorOpenAmount,
+          alignFactor: alignFactor,
+          inMouthZone: inMouthZone,
+          pushedIntoSlot: pushedIntoSlot,
+          rotX: rotX,
+          rotY: rotY,
+          rotZ: rotZ
+        };
+      }
+
       // DOM References
       const categoryBarEl = document.getElementById('category-bar');
       const searchInputEl = document.getElementById('game-search');
@@ -1766,10 +1930,12 @@
       const stageMainEl = document.getElementById('shelf');
       const canvasEl = document.getElementById('webgl-canvas');
 
+      const deckActionsEl = document.getElementById('deck-actions');
       const launchLinkEl = document.getElementById('launch-link');
       const powerLedEl = document.getElementById('power-led');
       const consoleReadoutEl = document.getElementById('console-readout');
       const ejectBtnEl = document.getElementById('eject-btn');
+      let xrEnterBtnEl = null;
 
       // Ordered unique categories
       const CATEGORIES = ['All'];
@@ -1890,6 +2056,10 @@
             launchLinkEl.href = url;
             launchLinkEl.hidden = false;
             launchLinkEl.classList.add('is-pending-launch');
+          }
+          if (state.xrSessionActive) {
+            triggerAnchorNewTab(url);
+            return;
           }
           if (state.isPointerDown && consoleReadoutEl) {
             consoleReadoutEl.textContent = consoleReadoutEl.textContent + ' · Release to open';
@@ -2272,7 +2442,8 @@
       const gl = canvasEl.getContext('webgl2', {
         antialias: !isSoftwareGl,
         alpha: true,
-        powerPreference: 'high-performance'
+        powerPreference: 'high-performance',
+        xrCompatible: true
       });
 
       const VS_SOURCE = `#version 300 es
@@ -2434,6 +2605,12 @@
         camParallaxY: 0,
         isPointerDown: false,
         pendingLaunchUrl: null,
+        xrSupported: false,
+        xrSessionActive: false,
+        vrActiveInputSource: null,
+        vrHandTargetPos: [0, 0, 0],
+        vrHandEuler: [-0.18, 0, 0],
+        vrAlignedHapticSent: false,
         displacedCartridges: [],
         timers: []
       };
@@ -2617,10 +2794,20 @@
       const _rearDoorPivotMat = mat4Create();
       const _displacedMat = mat4Create();
       const _ctrlBaseMat = mat4Create();
+      const _xrWorldToStageMat = mat4Create();
+      const _xrScaledViewMat = mat4Create();
+      const _xrVpMat = mat4Create();
+      const _xrCtrlMat = mat4Create();
+      const _xrRayMat = mat4Create();
+      const _xrRoomMat = mat4Create();
       const _eye = [0, 0.55, 9.6];
+      const _xrEyeWorld = [0, 0, 0];
       const _target = [0, -0.25, 0];
       const _up = [0, 1, 0];
       const _projPt = [0, 0];
+      let vrStageOrigin = [0, 1.38, -0.71];
+      let vrStageCalibrated = false;
+      const vrControllerDrawStates = [];
 
       // Console anchor coordinates in 3D world space
       const CONSOLE_POS = [0, -2.06, 1.15];
@@ -3116,9 +3303,11 @@
               (isInsertionBusyMode(state.animMode) ||
                 state.animMode === 'seated' ||
                 state.animMode === 'dragging' ||
+                state.animMode === 'vr-holding' ||
                 state.animMode === 'returning')) ||
             (state.animGameId === game.id &&
               (state.animMode === 'dragging' ||
+                state.animMode === 'vr-holding' ||
                 isInsertionBusyMode(state.animMode) ||
                 state.animMode === 'ejecting'));
           btn.classList.toggle('is-slotted', isLockedAway);
@@ -3370,7 +3559,72 @@
         setTimeout(poll, 5);
       }
 
-      function stepSimulationAndDraw(now) {
+      function render3DVrStudioRoom() {
+        mat4Identity(_xrRoomMat);
+        const floorWorldY = Math.min(-2.55, -vrStageOrigin[1] / VR_WORLD_SCALE);
+        // Studio floor & warm wood trim
+        drawBoxPart(_xrRoomMat, 0, floorWorldY - 0.08, 1.5, 28.0, 0.16, 28.0, [0.09, 0.095, 0.13], 0.85, 0.04, null);
+        // Walnut desk side legs down to the VR room floor
+        const legHeight = Math.max(0.4, -2.36 - floorWorldY);
+        const legCenterY = floorWorldY + legHeight * 0.5;
+        drawBoxPart(_xrRoomMat, -5.85, legCenterY, 1.10, 0.34, legHeight, 2.85, COL_IRON, 0.55, 0.55, null);
+        drawBoxPart(_xrRoomMat, 5.85, legCenterY, 1.10, 0.34, legHeight, 2.85, COL_IRON, 0.55, 0.55, null);
+        // Recessed architectural studio backdrop wall behind the rear cartridge return lane (z = -1.78)
+        drawBoxPart(_xrRoomMat, 0, 1.4, -1.78, 22.0, 15.0, 0.18, [0.11, 0.115, 0.165], 0.82, 0.04, null);
+        drawBoxPart(_xrRoomMat, 0, -2.16, -1.66, 22.0, 0.18, 0.08, COL_WOOD_TRIM, 0.52, 0.05, null);
+      }
+
+      function render3DVrControllers() {
+        for (let i = 0; i < vrControllerDrawStates.length; i++) {
+          const cs = vrControllerDrawStates[i];
+          if (!cs.visible) continue;
+
+          mat4Copy(_xrCtrlMat, cs.gripMat);
+          const pressAmt = cs.pressed ? 0.024 : 0.0;
+
+          // Retro NES-styled 3D Controller Wand (Light-grey housing, charcoal grip, black stripe, red button)
+          drawBoxPart(_xrCtrlMat, 0, -0.015, 0.16, 0.24, 0.18, 0.86, COL_NES_TOP, 0.42, 0.06, null);
+          drawBoxPart(_xrCtrlMat, 0, -0.055, 0.22, 0.20, 0.13, 0.72, COL_NES_BOT, 0.56, 0.06, null);
+          drawBoxPart(_xrCtrlMat, 0, 0.078, 0.12, 0.18, 0.016, 0.62, COL_NES_STRIPE, 0.48, 0.06, null);
+          drawBoxPart(
+            _xrCtrlMat,
+            0,
+            0.095 - pressAmt,
+            -0.04,
+            0.095,
+            0.036,
+            0.095,
+            COL_NES_RED,
+            0.22,
+            0.05,
+            null,
+            cs.hasTarget ? [0.45, 0.08, 0.08] : [0, 0, 0]
+          );
+
+          // Crisp aiming ray when not holding a cartridge directly in that hand
+          if (!cs.holdingCartridge && cs.beamLength > 0.08) {
+            mat4Copy(_xrRayMat, cs.rayMat);
+            const beamCol = cs.hasTarget ? [0.98, 0.32, 0.32] : [0.72, 0.76, 0.88];
+            const beamEmit = cs.hasTarget ? [0.85, 0.18, 0.18] : [0.18, 0.22, 0.32];
+            drawBoxPart(
+              _xrRayMat,
+              0,
+              0,
+              -0.06 - cs.beamLength * 0.5,
+              0.014,
+              0.014,
+              cs.beamLength,
+              beamCol,
+              0.25,
+              0.0,
+              null,
+              beamEmit
+            );
+          }
+        }
+      }
+
+      function stepSimulation(now) {
         const rawDt = (now - lastFrameTime) * 0.001;
         lastFrameTime = now;
         const dt = Math.min(0.16, Math.max(0.001, rawDt));
@@ -3419,7 +3673,7 @@
           state.ctrlRightPress = 0;
         }
 
-        // Advance Dragging, Returning, Snap-Inserting, Seated, Displaced Rear-Return & Ejecting States
+        // Advance Dragging, VR-Holding, Returning, Snap-Inserting, Seated, Displaced Rear-Return & Ejecting States
         let doorAngle = 0;
         let rearDoorAngle = 0;
         let trayDrop = 0;
@@ -3481,11 +3735,14 @@
           }
         }
 
-        // Keep an already-seated cartridge visible in the console if user is currently dragging/returning another one
+        // Keep an already-seated cartridge visible in the console if user is currently dragging/holding/returning another one
         if (
           state.slottedGameId &&
           state.slottedGameId !== state.animGameId &&
-          (state.animMode === 'seated' || state.animMode === 'dragging' || state.animMode === 'returning')
+          (state.animMode === 'seated' ||
+            state.animMode === 'dragging' ||
+            state.animMode === 'vr-holding' ||
+            state.animMode === 'returning')
         ) {
           const seatedRt = cartridgeRuntime[state.slottedGameId];
           seatedBackgroundPose = computeInsertionPose(
@@ -3579,6 +3836,77 @@
           // Once fully rotated -90 deg in place in the user's hand, seamlessly begin the horizontal slide-in!
           if (prox.inCaptureZone && state.holdRotateProgress >= 1.0 && heldGame) {
             commitSnapInsert(heldGame, state.dragCenter, SNAP_ROTATE_END);
+          }
+        } else if (state.animMode === 'vr-holding' && state.animGameId) {
+          keepAnimating = true;
+          const vrFollow = reduceMotion ? 1.0 : 1 - Math.exp(-32 * dt);
+          state.dragCenter.cx += (state.vrHandTargetPos[0] - state.dragCenter.cx) * vrFollow;
+          state.dragCenter.cy += (state.vrHandTargetPos[1] - state.dragCenter.cy) * vrFollow;
+          state.dragCenter.cz += (state.vrHandTargetPos[2] - state.dragCenter.cz) * vrFollow;
+
+          const vrSlot = evaluateVrSlotInteraction(
+            [state.dragCenter.cx, state.dragCenter.cy, state.dragCenter.cz],
+            state.vrHandEuler,
+            CONSOLE_SLOT_POS
+          );
+
+          if (vrSlot.doorOpenAmount > doorAngle) {
+            doorAngle = vrSlot.doorOpenAmount;
+          }
+
+          state.dragCenter.rotX += (vrSlot.rotX - state.dragCenter.rotX) * vrFollow;
+          state.dragCenter.rotY += (vrSlot.rotY - state.dragCenter.rotY) * vrFollow;
+          state.dragCenter.rotZ += (vrSlot.rotZ - state.dragCenter.rotZ) * vrFollow;
+
+          const heldGame = getCartridgeById(state.animGameId);
+
+          if (vrSlot.inMouthZone) {
+            if (state.ledState !== 'red') {
+              setLedState('red');
+            }
+            if (!state.vrAlignedHapticSent) {
+              state.vrAlignedHapticSent = true;
+              pulseControllerHaptics(state.vrActiveInputSource, 0.24, 20);
+            }
+            if (heldGame) {
+              consoleReadoutEl.textContent =
+                'Aligned ' + heldGame.title + ' · Push into slot or release to load';
+            }
+          } else {
+            state.vrAlignedHapticSent = false;
+            const fallbackLed = state.slottedGameId ? 'green' : 'off';
+            if (state.ledState !== fallbackLed) {
+              setLedState(fallbackLed);
+            }
+            if (heldGame) {
+              consoleReadoutEl.textContent =
+                'Holding ' + heldGame.title + ' · Put cartridge into the console slot';
+            }
+          }
+
+          const vrRoot = cartridgeCenterToRoot(
+            state.dragCenter.cx,
+            state.dragCenter.cy,
+            state.dragCenter.cz,
+            state.dragCenter.rotX,
+            state.dragCenter.rotY,
+            state.dragCenter.rotZ
+          );
+          activePose = {
+            x: vrRoot[0],
+            y: vrRoot[1],
+            z: vrRoot[2],
+            rotX: state.dragCenter.rotX,
+            rotY: state.dragCenter.rotY,
+            rotZ: state.dragCenter.rotZ
+          };
+
+          // Physical push-in engagement: sliding the held cartridge past the console mouth slots it right in!
+          if (vrSlot.pushedIntoSlot && heldGame) {
+            pulseControllerHaptics(state.vrActiveInputSource, 0.90, 50);
+            state.vrActiveInputSource = null;
+            state.vrAlignedHapticSent = false;
+            commitSnapInsert(heldGame, state.dragCenter, SNAP_ROTATE_END, 760);
           }
         } else if (state.animMode === 'returning' && state.animGameId) {
           keepAnimating = true;
@@ -3720,6 +4048,7 @@
           const isHovered =
             state.hoveredGameId === g.id &&
             state.animMode !== 'dragging' &&
+            state.animMode !== 'vr-holding' &&
             state.animGameId !== g.id &&
             state.slottedGameId !== g.id &&
             !isCartridgeDisplaced(g.id) &&
@@ -3738,7 +4067,186 @@
           }
         }
 
-        if (!gl) return keepAnimating;
+        return {
+          now: now,
+          keepAnimating: keepAnimating,
+          doorAngle: doorAngle,
+          rearDoorAngle: rearDoorAngle,
+          trayDrop: trayDrop,
+          powerPress: powerPress,
+          activePose: activePose,
+          seatedBackgroundPose: seatedBackgroundPose,
+          activeDisplacedDraws: activeDisplacedDraws
+        };
+      }
+
+      function renderScenePass(vpMat, eyePos, sim, isImmersiveVr) {
+        gl.useProgram(glProgram);
+        gl.bindVertexArray(unitBoxVao);
+        gl.uniformMatrix4fv(uniforms.uViewProj, false, vpMat);
+        gl.uniform3fv(uniforms.uCameraPos, eyePos);
+
+        // Dynamic Power LED Point Light Uniforms
+        gl.uniform3f(
+          uniforms.uLedWorldPos,
+          CONSOLE_POS[0] - 1.43,
+          CONSOLE_POS[1] + 0.25,
+          CONSOLE_POS[2] + 1.16
+        );
+        if (state.ledState === 'red') {
+          gl.uniform3f(uniforms.uLedColor, 1.0, 0.22, 0.22);
+          gl.uniform1f(uniforms.uLedIntensity, 1.35);
+        } else if (state.ledState === 'green') {
+          gl.uniform3f(uniforms.uLedColor, 0.28, 1.0, 0.52);
+          gl.uniform1f(uniforms.uLedIntensity, 1.45);
+        } else {
+          gl.uniform3f(uniforms.uLedColor, 0.0, 0.0, 0.0);
+          gl.uniform1f(uniforms.uLedIntensity, 0.0);
+        }
+
+        if (isImmersiveVr) {
+          render3DVrStudioRoom();
+        }
+
+        // 1. Render 3D Walnut Shelves
+        render3DShelves();
+
+        // 2. Render 3D NES Console & 3D Controller on Desk
+        render3DConsoleAndDesk(
+          sim.doorAngle,
+          sim.trayDrop,
+          sim.powerPress,
+          state.ejectPress,
+          sim.rearDoorAngle
+        );
+
+        // 3. Render Soft Contact Shadows on Shelves for Seated Shelf Cartridges
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        gl.depthMask(false);
+        mat4Identity(_consoleBaseMat);
+        for (let i = 0; i < visibleGamesCache.length; i++) {
+          const g = visibleGamesCache[i];
+          const dispEntry = getDisplacedCartridgeEntry(g.id);
+          const isAway =
+            (state.animMode !== 'idle' && state.animGameId === g.id) ||
+            (state.slottedGameId === g.id &&
+              (state.animMode === 'seated' ||
+                state.animMode === 'dragging' ||
+                state.animMode === 'vr-holding' ||
+                state.animMode === 'returning' ||
+                isInsertionBusyMode(state.animMode)));
+          const rt = cartridgeRuntime[g.id];
+          let shadowAlpha = isAway ? 0.14 : 0.65 * (1 - rt.hoverLift * 0.35);
+          if (dispEntry) {
+            const dp = Math.min(1, Math.max(0, (sim.now - dispEntry.startTime) / DISPLACED_RETURN_MS));
+            shadowAlpha = 0.14 + (0.65 - 0.14) * smoothstep(0.70, 1.0, dp);
+          }
+          drawBoxPart(
+            _consoleBaseMat,
+            rt.shelfX,
+            rt.shelfY + 0.004,
+            rt.shelfZ,
+            1.15,
+            0.003,
+            0.44,
+            [0, 0, 0],
+            -1.0,
+            0,
+            shadowTex,
+            null,
+            shadowAlpha
+          );
+        }
+        gl.depthMask(true);
+        gl.disable(gl.BLEND);
+
+        // 4. Render All Visible Shelf 3D Cartridges
+        const activeId = state.animMode === 'seated' ? state.slottedGameId : state.animGameId;
+
+        for (let i = 0; i < visibleGamesCache.length; i++) {
+          const g = visibleGamesCache[i];
+          if (g.id === activeId) continue;
+          if (sim.seatedBackgroundPose && g.id === state.slottedGameId) continue;
+          if (isCartridgeDisplaced(g.id)) continue;
+
+          const rt = cartridgeRuntime[g.id];
+          mat4Identity(rt.worldMat);
+          mat4Translate(
+            rt.worldMat,
+            rt.worldMat,
+            rt.shelfX,
+            rt.shelfY + rt.hoverLift * 0.18,
+            rt.shelfZ + rt.hoverLift * 0.30
+          );
+          mat4RotateY(rt.worldMat, rt.worldMat, rt.baseRotY + rt.hoverTiltY);
+          mat4RotateX(rt.worldMat, rt.worldMat, rt.hoverTiltX);
+          render3DCartridge(rt.worldMat, g);
+        }
+
+        // 5a. Render Already-Seated Cartridge inside Console while user drags/holds a new one
+        if (sim.seatedBackgroundPose && state.slottedGameId) {
+          const seatedGame = getCartridgeById(state.slottedGameId);
+          if (seatedGame) {
+            const srt = cartridgeRuntime[state.slottedGameId];
+            mat4Identity(srt.worldMat);
+            mat4Translate(
+              srt.worldMat,
+              srt.worldMat,
+              sim.seatedBackgroundPose.x,
+              sim.seatedBackgroundPose.y,
+              sim.seatedBackgroundPose.z
+            );
+            mat4RotateY(srt.worldMat, srt.worldMat, sim.seatedBackgroundPose.rotY);
+            mat4RotateZ(srt.worldMat, srt.worldMat, sim.seatedBackgroundPose.rotZ);
+            mat4RotateX(srt.worldMat, srt.worldMat, sim.seatedBackgroundPose.rotX);
+            render3DCartridge(srt.worldMat, seatedGame);
+          }
+        }
+
+        // 5b. Render Outgoing Displaced Cartridge(s) Going Through Behind & Sliding Into Place (1.5s)
+        for (let d = 0; d < sim.activeDisplacedDraws.length; d++) {
+          const dItem = sim.activeDisplacedDraws[d];
+          const dGame = getCartridgeById(dItem.id);
+          if (!dGame) continue;
+          const dPose = dItem.pose;
+          mat4Identity(_displacedMat);
+          mat4Translate(_displacedMat, _displacedMat, dPose.x, dPose.y, dPose.z);
+          mat4RotateY(_displacedMat, _displacedMat, dPose.rotY);
+          mat4RotateZ(_displacedMat, _displacedMat, dPose.rotZ);
+          mat4RotateX(_displacedMat, _displacedMat, dPose.rotX);
+          if (dPose.scale !== undefined && dPose.scale < 0.999) {
+            mat4Scale(_displacedMat, _displacedMat, dPose.scale, dPose.scale, dPose.scale);
+          }
+          render3DCartridge(_displacedMat, dGame);
+        }
+
+        // 5c. Render Active Held / Returning / Inserting / Seated 3D Cartridge
+        if (activeId && sim.activePose) {
+          const activeGame = getCartridgeById(activeId);
+          if (activeGame) {
+            const rt = cartridgeRuntime[activeId];
+            mat4Identity(rt.worldMat);
+            mat4Translate(rt.worldMat, rt.worldMat, sim.activePose.x, sim.activePose.y, sim.activePose.z);
+            mat4RotateY(rt.worldMat, rt.worldMat, sim.activePose.rotY);
+            mat4RotateZ(rt.worldMat, rt.worldMat, sim.activePose.rotZ);
+            mat4RotateX(rt.worldMat, rt.worldMat, sim.activePose.rotX);
+            render3DCartridge(rt.worldMat, activeGame);
+          }
+        }
+
+        if (isImmersiveVr) {
+          render3DVrControllers();
+        }
+
+        gl.bindVertexArray(null);
+      }
+
+      function stepSimulationAndDraw(now) {
+        const sim = stepSimulation(now);
+        if (!gl) return sim.keepAnimating;
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
         // Resize canvas cleanly if needed
         const rect = stageMainEl.getBoundingClientRect();
@@ -3781,156 +4289,19 @@
         mat4LookAt(_viewMat, _eye, _target, _up);
         mat4Multiply(_vpMat, _projMat, _viewMat);
 
-        gl.useProgram(glProgram);
-        gl.bindVertexArray(unitBoxVao);
-        gl.uniformMatrix4fv(uniforms.uViewProj, false, _vpMat);
-        gl.uniform3fv(uniforms.uCameraPos, _eye);
-
-        // Dynamic Power LED Point Light Uniforms
-        gl.uniform3f(
-          uniforms.uLedWorldPos,
-          CONSOLE_POS[0] - 1.43,
-          CONSOLE_POS[1] + 0.25,
-          CONSOLE_POS[2] + 1.16
-        );
-        if (state.ledState === 'red') {
-          gl.uniform3f(uniforms.uLedColor, 1.0, 0.22, 0.22);
-          gl.uniform1f(uniforms.uLedIntensity, 1.35);
-        } else if (state.ledState === 'green') {
-          gl.uniform3f(uniforms.uLedColor, 0.28, 1.0, 0.52);
-          gl.uniform1f(uniforms.uLedIntensity, 1.45);
-        } else {
-          gl.uniform3f(uniforms.uLedColor, 0.0, 0.0, 0.0);
-          gl.uniform1f(uniforms.uLedIntensity, 0.0);
-        }
-
-        // 1. Render 3D Walnut Shelves
-        render3DShelves();
-
-        // 2. Render 3D NES Console & 3D Controller on Desk
-        render3DConsoleAndDesk(doorAngle, trayDrop, powerPress, state.ejectPress, rearDoorAngle);
-
-        // 3. Render Soft Contact Shadows on Shelves for Seated Shelf Cartridges
-        gl.enable(gl.BLEND);
-        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-        gl.depthMask(false);
-        mat4Identity(_consoleBaseMat);
-        for (let i = 0; i < visibleGamesCache.length; i++) {
-          const g = visibleGamesCache[i];
-          const dispEntry = getDisplacedCartridgeEntry(g.id);
-          const isAway =
-            (state.animMode !== 'idle' && state.animGameId === g.id) ||
-            (state.slottedGameId === g.id &&
-              (state.animMode === 'seated' ||
-                state.animMode === 'dragging' ||
-                state.animMode === 'returning' ||
-                isInsertionBusyMode(state.animMode)));
-          const rt = cartridgeRuntime[g.id];
-          let shadowAlpha = isAway ? 0.14 : 0.65 * (1 - rt.hoverLift * 0.35);
-          if (dispEntry) {
-            const dp = Math.min(1, Math.max(0, (now - dispEntry.startTime) / DISPLACED_RETURN_MS));
-            shadowAlpha = 0.14 + (0.65 - 0.14) * smoothstep(0.70, 1.0, dp);
-          }
-          drawBoxPart(
-            _consoleBaseMat,
-            rt.shelfX,
-            rt.shelfY + 0.004,
-            rt.shelfZ,
-            1.15,
-            0.003,
-            0.44,
-            [0, 0, 0],
-            -1.0,
-            0,
-            shadowTex,
-            null,
-            shadowAlpha
-          );
-        }
-        gl.depthMask(true);
-        gl.disable(gl.BLEND);
-
-        // 4. Render All Visible Shelf 3D Cartridges
-        const activeId = state.animMode === 'seated' ? state.slottedGameId : state.animGameId;
-
-        for (let i = 0; i < visibleGamesCache.length; i++) {
-          const g = visibleGamesCache[i];
-          if (g.id === activeId) continue;
-          if (seatedBackgroundPose && g.id === state.slottedGameId) continue;
-          if (isCartridgeDisplaced(g.id)) continue;
-
-          const rt = cartridgeRuntime[g.id];
-          mat4Identity(rt.worldMat);
-          mat4Translate(
-            rt.worldMat,
-            rt.worldMat,
-            rt.shelfX,
-            rt.shelfY + rt.hoverLift * 0.18,
-            rt.shelfZ + rt.hoverLift * 0.30
-          );
-          mat4RotateY(rt.worldMat, rt.worldMat, rt.baseRotY + rt.hoverTiltY);
-          mat4RotateX(rt.worldMat, rt.worldMat, rt.hoverTiltX);
-          render3DCartridge(rt.worldMat, g);
-        }
-
-        // 5a. Render Already-Seated Cartridge inside Console while user drags a new one
-        if (seatedBackgroundPose && state.slottedGameId) {
-          const seatedGame = getCartridgeById(state.slottedGameId);
-          if (seatedGame) {
-            const srt = cartridgeRuntime[state.slottedGameId];
-            mat4Identity(srt.worldMat);
-            mat4Translate(
-              srt.worldMat,
-              srt.worldMat,
-              seatedBackgroundPose.x,
-              seatedBackgroundPose.y,
-              seatedBackgroundPose.z
-            );
-            mat4RotateY(srt.worldMat, srt.worldMat, seatedBackgroundPose.rotY);
-            mat4RotateZ(srt.worldMat, srt.worldMat, seatedBackgroundPose.rotZ);
-            mat4RotateX(srt.worldMat, srt.worldMat, seatedBackgroundPose.rotX);
-            render3DCartridge(srt.worldMat, seatedGame);
-          }
-        }
-
-        // 5b. Render Outgoing Displaced Cartridge(s) Going Through Behind & Sliding Into Place (1.5s)
-        for (let d = 0; d < activeDisplacedDraws.length; d++) {
-          const dItem = activeDisplacedDraws[d];
-          const dGame = getCartridgeById(dItem.id);
-          if (!dGame) continue;
-          const dPose = dItem.pose;
-          mat4Identity(_displacedMat);
-          mat4Translate(_displacedMat, _displacedMat, dPose.x, dPose.y, dPose.z);
-          mat4RotateY(_displacedMat, _displacedMat, dPose.rotY);
-          mat4RotateZ(_displacedMat, _displacedMat, dPose.rotZ);
-          mat4RotateX(_displacedMat, _displacedMat, dPose.rotX);
-          if (dPose.scale !== undefined && dPose.scale < 0.999) {
-            mat4Scale(_displacedMat, _displacedMat, dPose.scale, dPose.scale, dPose.scale);
-          }
-          render3DCartridge(_displacedMat, dGame);
-        }
-
-        // 5c. Render Active Held / Returning / Inserting / Seated 3D Cartridge
-        if (activeId && activePose) {
-          const activeGame = getCartridgeById(activeId);
-          if (activeGame) {
-            const rt = cartridgeRuntime[activeId];
-            mat4Identity(rt.worldMat);
-            mat4Translate(rt.worldMat, rt.worldMat, activePose.x, activePose.y, activePose.z);
-            mat4RotateY(rt.worldMat, rt.worldMat, activePose.rotY);
-            mat4RotateZ(rt.worldMat, rt.worldMat, activePose.rotZ);
-            mat4RotateX(rt.worldMat, rt.worldMat, activePose.rotX);
-            render3DCartridge(rt.worldMat, activeGame);
-          }
-        }
-
-        gl.bindVertexArray(null);
+        renderScenePass(_vpMat, _eye, sim, false);
         updateProjectedHitBoxes(rect.width, rect.height);
 
-        return keepAnimating;
+        return sim.keepAnimating;
       }
 
+      let xrSession = null;
+      let xrRefSpace = null;
+
       function requestRender() {
+        if (xrSession) {
+          return;
+        }
         if (renderBusy) {
           renderDirty = true;
           return;
@@ -3942,10 +4313,15 @@
         }
         requestAnimationFrame(function (now) {
           renderDirty = false;
+          if (xrSession) {
+            renderBusy = false;
+            loopIdle = true;
+            return;
+          }
           const needsMore = stepSimulationAndDraw(now);
           const done = function () {
             renderBusy = false;
-            if (renderDirty || needsMore) {
+            if (!xrSession && (renderDirty || needsMore)) {
               requestRender();
             } else {
               loopIdle = true;
@@ -4148,7 +4524,21 @@
         launchLinkEl.hidden = false;
         ejectBtnEl.disabled = false;
         requestRender();
+
+        const wasInXr = Boolean(xrSession);
+        if (wasInXr) {
+          pulseAllXrControllers(0.85, 55);
+        }
         openUrlInNewTab(game.url);
+        if (wasInXr && xrSession) {
+          const sessionToClose = xrSession;
+          const endTimer = setTimeout(function () {
+            if (xrSession === sessionToClose) {
+              sessionToClose.end().catch(function () {});
+            }
+          }, 220);
+          state.timers.push(endTimer);
+        }
       }
 
       function commitSnapInsert(game, startPose, initialProgress, customTotalMs) {
@@ -4485,6 +4875,675 @@
         requestRender();
       });
 
+      // =========================================================================
+      // WebXR Immersive-VR Session, 6DoF Physical Cartridge Grab & Slot Insertion
+      // Strict Rule: VR button/text ONLY exists in the DOM when VR is detected!
+      // =========================================================================
+      const vrInputMap = new Map();
+
+      function pulseControllerHaptics(inputSource, intensity, durationMs) {
+        if (!inputSource || !inputSource.gamepad) return;
+        try {
+          const actuators = inputSource.gamepad.hapticActuators;
+          if (actuators && actuators.length > 0 && typeof actuators[0].pulse === 'function') {
+            actuators[0].pulse(intensity, durationMs).catch(function () {});
+          }
+        } catch (_e) {
+          // Ignore unsupported haptics
+        }
+      }
+
+      function pulseAllXrControllers(intensity, durationMs) {
+        if (!xrSession || !xrSession.inputSources) return;
+        for (let i = 0; i < xrSession.inputSources.length; i++) {
+          pulseControllerHaptics(xrSession.inputSources[i], intensity, durationMs);
+        }
+      }
+
+      function getOrCreateVrInputState(source) {
+        let entry = vrInputMap.get(source);
+        if (!entry) {
+          entry = {
+            gripMat: mat4Create(),
+            rayMat: mat4Create(),
+            gripPos: [0, 0, 0],
+            rayOrigin: [0, 0, 0],
+            rayDir: [0, 0, -1],
+            quat: [0, 0, 0, 1],
+            isSelecting: false,
+            isSqueezing: false,
+            target: null,
+            hitDist: 3.4,
+            lastHoveredId: null
+          };
+          vrInputMap.set(source, entry);
+        }
+        return entry;
+      }
+
+      function poseTransformToWorldMat(outMat, xrTransform, stageOrigin) {
+        const m = xrTransform.matrix;
+        outMat.set(m);
+        const wp = xrPointToSceneWorld(
+          [xrTransform.position.x, xrTransform.position.y, xrTransform.position.z],
+          stageOrigin
+        );
+        outMat[12] = wp[0];
+        outMat[13] = wp[1];
+        outMat[14] = wp[2];
+        outMat[15] = 1;
+        return wp;
+      }
+
+      function evaluateVrControllerTarget(gripPos, rayOrigin, rayDir) {
+        let bestTarget = null;
+        let bestReachDist = 0.96;
+
+        // 1. Direct 3D physical hand reach to shelf cartridges (highest priority)
+        for (let i = 0; i < visibleGamesCache.length; i++) {
+          const g = visibleGamesCache[i];
+          if (
+            isCartridgeDisplaced(g.id) ||
+            (state.slottedGameId === g.id &&
+              (state.animMode === 'seated' || isInsertionBusyMode(state.animMode))) ||
+            (state.animGameId === g.id && state.animMode !== 'idle')
+          ) {
+            continue;
+          }
+          const rt = cartridgeRuntime[g.id];
+          const cx = rt.shelfX;
+          const cy = rt.shelfY + CART_CENTER_Y;
+          const cz = rt.shelfZ;
+          const d = Math.hypot((gripPos[0] - cx) / 0.88, (gripPos[1] - cy) / 0.92, (gripPos[2] - cz) / 0.95);
+          if (d < bestReachDist) {
+            bestReachDist = d;
+            bestTarget = { type: 'cartridge', game: g, dist: 0.12 };
+          }
+        }
+
+        // Direct 3D poke on Console Eject button
+        const ejX = CONSOLE_POS[0] - 0.80;
+        const ejY = CONSOLE_POS[1] + 0.25;
+        const ejZ = CONSOLE_POS[2] + 1.05;
+        if (Math.hypot(gripPos[0] - ejX, gripPos[1] - ejY, gripPos[2] - ejZ) < 0.42 && state.slottedGameId) {
+          return { type: 'eject', dist: 0.10 };
+        }
+
+        // Direct 3D poke on NES Controller Left (B) / Right (A) buttons
+        const ctrlLx = 2.74, ctrlLy = -1.86, ctrlLz = 1.84;
+        const ctrlRx = 3.08, ctrlRy = -1.86, ctrlRz = 1.94;
+        if (Math.hypot(gripPos[0] - ctrlLx, gripPos[1] - ctrlLy, gripPos[2] - ctrlLz) < 0.32) {
+          return { type: 'ctrl', side: 'left', dist: 0.10 };
+        }
+        if (Math.hypot(gripPos[0] - ctrlRx, gripPos[1] - ctrlRy, gripPos[2] - ctrlRz) < 0.32) {
+          return { type: 'ctrl', side: 'right', dist: 0.10 };
+        }
+
+        if (bestTarget) {
+          return bestTarget;
+        }
+
+        // 2. Seated/distant raycast fallback against shelf cartridges, Eject button & Controller buttons
+        let minRayT = 18.0;
+        let rayHit = null;
+
+        for (let i = 0; i < visibleGamesCache.length; i++) {
+          const g = visibleGamesCache[i];
+          if (
+            isCartridgeDisplaced(g.id) ||
+            (state.slottedGameId === g.id &&
+              (state.animMode === 'seated' || isInsertionBusyMode(state.animMode))) ||
+            (state.animGameId === g.id && state.animMode !== 'idle')
+          ) {
+            continue;
+          }
+          const rt = cartridgeRuntime[g.id];
+          const t = intersectRayAabb(
+            rayOrigin,
+            rayDir,
+            [rt.shelfX - 0.56, rt.shelfY - 0.04, rt.shelfZ - 0.22],
+            [rt.shelfX + 0.56, rt.shelfY + 1.25, rt.shelfZ + 0.24]
+          );
+          if (t !== null && t < minRayT) {
+            minRayT = t;
+            rayHit = { type: 'cartridge', game: g, dist: t };
+          }
+        }
+
+        if (state.slottedGameId) {
+          const tEj = intersectRayAabb(
+            rayOrigin,
+            rayDir,
+            [ejX - 0.24, ejY - 0.16, ejZ - 0.16],
+            [ejX + 0.24, ejY + 0.16, ejZ + 0.16]
+          );
+          if (tEj !== null && tEj < minRayT) {
+            minRayT = tEj;
+            rayHit = { type: 'eject', dist: tEj };
+          }
+        }
+
+        const tCtrlL = intersectRayAabb(
+          rayOrigin,
+          rayDir,
+          [2.52, -2.02, 1.62],
+          [2.88, -1.74, 2.02]
+        );
+        if (tCtrlL !== null && tCtrlL < minRayT) {
+          minRayT = tCtrlL;
+          rayHit = { type: 'ctrl', side: 'left', dist: tCtrlL };
+        }
+        const tCtrlR = intersectRayAabb(
+          rayOrigin,
+          rayDir,
+          [2.89, -2.02, 1.68],
+          [3.28, -1.74, 2.10]
+        );
+        if (tCtrlR !== null && tCtrlR < minRayT) {
+          minRayT = tCtrlR;
+          rayHit = { type: 'ctrl', side: 'right', dist: tCtrlR };
+        }
+
+        return rayHit;
+      }
+
+      function updateSingleXrInputSource(source, xrFrame, refSpace) {
+        if (!source || !xrFrame || !refSpace) return null;
+        const entry = getOrCreateVrInputState(source);
+        const raySpace = source.targetRaySpace || source.gripSpace;
+        const gripSpace = source.gripSpace || source.targetRaySpace;
+        if (!raySpace || !gripSpace) return null;
+
+        const rayPose = xrFrame.getPose(raySpace, refSpace);
+        const gripPose = xrFrame.getPose(gripSpace, refSpace) || rayPose;
+        if (!rayPose || !gripPose) return null;
+
+        const ro = poseTransformToWorldMat(entry.rayMat, rayPose.transform, vrStageOrigin);
+        const gp = poseTransformToWorldMat(entry.gripMat, gripPose.transform, vrStageOrigin);
+
+        entry.rayOrigin[0] = ro[0];
+        entry.rayOrigin[1] = ro[1];
+        entry.rayOrigin[2] = ro[2];
+        entry.rayDir[0] = -entry.rayMat[8];
+        entry.rayDir[1] = -entry.rayMat[9];
+        entry.rayDir[2] = -entry.rayMat[10];
+        const rLen = Math.hypot(entry.rayDir[0], entry.rayDir[1], entry.rayDir[2]) || 1;
+        entry.rayDir[0] /= rLen;
+        entry.rayDir[1] /= rLen;
+        entry.rayDir[2] /= rLen;
+
+        entry.gripPos[0] = gp[0];
+        entry.gripPos[1] = gp[1];
+        entry.gripPos[2] = gp[2];
+        entry.quat[0] = gripPose.transform.orientation.x;
+        entry.quat[1] = gripPose.transform.orientation.y;
+        entry.quat[2] = gripPose.transform.orientation.z;
+        entry.quat[3] = gripPose.transform.orientation.w;
+
+        if (state.animMode === 'vr-holding' && state.vrActiveInputSource === source) {
+          const fwdX = -entry.gripMat[8];
+          const fwdY = -entry.gripMat[9];
+          const fwdZ = -entry.gripMat[10];
+          state.vrHandTargetPos[0] = entry.gripPos[0] + fwdX * 0.34;
+          state.vrHandTargetPos[1] = entry.gripPos[1] + fwdY * 0.34 + 0.08;
+          state.vrHandTargetPos[2] = entry.gripPos[2] + fwdZ * 0.34;
+          state.vrHandEuler = extractVrHandCartridgeEuler(entry.quat);
+          entry.target = null;
+          entry.hitDist = 0;
+        } else {
+          const hit = evaluateVrControllerTarget(entry.gripPos, entry.rayOrigin, entry.rayDir);
+          entry.target = hit;
+          entry.hitDist = hit ? Math.max(0.08, hit.dist - 0.06) : 3.2;
+          const nextHoverId = hit && hit.type === 'cartridge' ? hit.game.id : null;
+          if (nextHoverId && nextHoverId !== entry.lastHoveredId) {
+            pulseControllerHaptics(source, 0.10, 12);
+          }
+          entry.lastHoveredId = nextHoverId;
+        }
+        return entry;
+      }
+
+      function updateAllXrInputs(xrFrame, refSpace) {
+        vrControllerDrawStates.length = 0;
+        if (!xrSession || !xrSession.inputSources) return;
+
+        let hoveredCartId = null;
+        let hoveredCtrl = null;
+
+        for (let i = 0; i < xrSession.inputSources.length; i++) {
+          const src = xrSession.inputSources[i];
+          const entry = updateSingleXrInputSource(src, xrFrame, refSpace);
+          if (!entry) continue;
+
+          if (entry.target) {
+            if (entry.target.type === 'cartridge' && !hoveredCartId) {
+              hoveredCartId = entry.target.game.id;
+            } else if (entry.target.type === 'ctrl' && !hoveredCtrl) {
+              hoveredCtrl = entry.target.side;
+            }
+          }
+
+          vrControllerDrawStates.push({
+            visible: true,
+            gripMat: entry.gripMat,
+            rayMat: entry.rayMat,
+            pressed: entry.isSelecting || entry.isSqueezing,
+            holdingCartridge: state.animMode === 'vr-holding' && state.vrActiveInputSource === src,
+            hasTarget: Boolean(entry.target),
+            beamLength: entry.hitDist
+          });
+        }
+
+        if (state.animMode !== 'vr-holding') {
+          state.hoveredGameId = hoveredCartId;
+        }
+        state.hoveredCtrlBtn = hoveredCtrl;
+      }
+
+      function startVrCartridgeGrab(game, source, entry) {
+        if (
+          !game ||
+          isInsertionBusyMode(state.animMode) ||
+          state.animMode === 'ejecting' ||
+          state.animMode === 'vr-holding'
+        ) {
+          return;
+        }
+        getAudioContext();
+        pulseControllerHaptics(source, 0.38, 28);
+
+        const rt = cartridgeRuntime[game.id];
+        const wasReturningSame = state.animMode === 'returning' && state.animGameId === game.id;
+
+        if (!wasReturningSame) {
+          const c0 = cartridgeRootToCenter(
+            rt.shelfX,
+            rt.shelfY + rt.hoverLift * 0.18,
+            rt.shelfZ + rt.hoverLift * 0.30,
+            rt.hoverTiltX,
+            rt.baseRotY + rt.hoverTiltY,
+            0
+          );
+          state.dragCenter.cx = c0[0];
+          state.dragCenter.cy = c0[1];
+          state.dragCenter.cz = c0[2];
+          state.dragCenter.rotX = rt.hoverTiltX;
+          state.dragCenter.rotY = rt.baseRotY + rt.hoverTiltY;
+          state.dragCenter.rotZ = 0;
+        }
+
+        const fwdX = -entry.gripMat[8];
+        const fwdY = -entry.gripMat[9];
+        const fwdZ = -entry.gripMat[10];
+        state.vrHandTargetPos[0] = entry.gripPos[0] + fwdX * 0.34;
+        state.vrHandTargetPos[1] = entry.gripPos[1] + fwdY * 0.34 + 0.08;
+        state.vrHandTargetPos[2] = entry.gripPos[2] + fwdZ * 0.34;
+        state.vrHandEuler = extractVrHandCartridgeEuler(entry.quat);
+
+        state.vrActiveInputSource = source;
+        state.vrAlignedHapticSent = false;
+        state.hoveredGameId = null;
+        state.animMode = 'vr-holding';
+        state.animGameId = game.id;
+
+        consoleReadoutEl.textContent =
+          'Holding ' + game.title + ' · Put cartridge into the console slot';
+        syncHitButtonsState();
+      }
+
+      function finishVrCartridgeGrab() {
+        if (state.animMode !== 'vr-holding' || !state.animGameId) return;
+        const heldGame = getCartridgeById(state.animGameId);
+        const releasingSource = state.vrActiveInputSource;
+        state.vrActiveInputSource = null;
+        state.vrAlignedHapticSent = false;
+
+        const vrSlot = evaluateVrSlotInteraction(
+          [state.dragCenter.cx, state.dragCenter.cy, state.dragCenter.cz],
+          state.vrHandEuler,
+          CONSOLE_SLOT_POS
+        );
+
+        if (heldGame && (vrSlot.inMouthZone || vrSlot.pushedIntoSlot)) {
+          pulseControllerHaptics(releasingSource, 0.85, 45);
+          commitSnapInsert(
+            heldGame,
+            state.dragCenter,
+            vrSlot.alignFactor * SNAP_ROTATE_END,
+            920
+          );
+          return;
+        }
+
+        setLedState(state.slottedGameId ? 'green' : 'off');
+        state.snapStartPose = {
+          cx: state.dragCenter.cx,
+          cy: state.dragCenter.cy,
+          cz: state.dragCenter.cz,
+          rotX: state.dragCenter.rotX,
+          rotY: state.dragCenter.rotY,
+          rotZ: state.dragCenter.rotZ
+        };
+        state.animMode = 'returning';
+        state.animStartTime = performance.now();
+        syncHitButtonsState();
+
+        if (state.slottedGameId) {
+          const running = getCartridgeById(state.slottedGameId);
+          if (running) {
+            consoleReadoutEl.textContent = running.isControllerPak
+              ? 'Expansion Cartridge Loaded'
+              : 'Running: ' + running.title;
+          }
+        } else {
+          consoleReadoutEl.textContent = state.xrSessionActive
+            ? 'Console Ready · Grab a cartridge and put it in the slot'
+            : 'Console Ready · Click or drag a cartridge to the slot';
+        }
+      }
+
+      function handleXrGrabPress(e, kind) {
+        if (!xrSession || !xrRefSpace) return;
+        const source = e.inputSource;
+        const entry = updateSingleXrInputSource(source, e.frame, xrRefSpace) || getOrCreateVrInputState(source);
+        if (kind === 'select') {
+          entry.isSelecting = true;
+        } else {
+          entry.isSqueezing = true;
+        }
+
+        if (state.animMode === 'vr-holding') {
+          return;
+        }
+
+        if (entry.target) {
+          if (entry.target.type === 'cartridge') {
+            startVrCartridgeGrab(entry.target.game, source, entry);
+            return;
+          }
+          if (entry.target.type === 'eject') {
+            pulseControllerHaptics(source, 0.55, 30);
+            triggerEjectCartridge();
+            return;
+          }
+          if (entry.target.type === 'ctrl') {
+            pulseControllerHaptics(source, 0.55, 30);
+            triggerControllerCartridgeInsert(entry.target.side);
+            return;
+          }
+        }
+
+        // Allow pulling an already-seated shelf cartridge directly out of the open console bay in VR
+        if (state.animMode === 'seated' && state.slottedGameId) {
+          const seatedSlotCheck = evaluateVrSlotInteraction(entry.gripPos, null, CONSOLE_SLOT_POS);
+          const seatedGame = GAMES.find(function (g) {
+            return g.id === state.slottedGameId;
+          });
+          if (seatedSlotCheck.inMouthZone && seatedGame) {
+            clearPendingTimers();
+            playClickSound('eject');
+            pulseControllerHaptics(source, 0.50, 32);
+            const seatedPose = computeInsertionPose(
+              1.0,
+              [0, 0, 0, 0],
+              CONSOLE_SLOT_POS
+            );
+            const cSeated = cartridgeRootToCenter(
+              seatedPose.x,
+              seatedPose.y,
+              seatedPose.z,
+              seatedPose.rotX,
+              seatedPose.rotY,
+              seatedPose.rotZ
+            );
+            state.slottedGameId = null;
+            setLedState('off');
+            launchLinkEl.hidden = true;
+            launchLinkEl.removeAttribute('href');
+            ejectBtnEl.disabled = true;
+
+            state.dragCenter.cx = cSeated[0];
+            state.dragCenter.cy = cSeated[1];
+            state.dragCenter.cz = cSeated[2];
+            state.dragCenter.rotX = seatedPose.rotX;
+            state.dragCenter.rotY = seatedPose.rotY;
+            state.dragCenter.rotZ = seatedPose.rotZ;
+
+            state.vrActiveInputSource = source;
+            state.vrAlignedHapticSent = true;
+            state.animMode = 'vr-holding';
+            state.animGameId = seatedGame.id;
+            syncHitButtonsState();
+          }
+        }
+      }
+
+      function handleXrGrabRelease(e, kind) {
+        const source = e.inputSource;
+        const entry = getOrCreateVrInputState(source);
+        if (kind === 'select') {
+          entry.isSelecting = false;
+        } else {
+          entry.isSqueezing = false;
+        }
+        if (
+          state.animMode === 'vr-holding' &&
+          state.vrActiveInputSource === source &&
+          !entry.isSelecting &&
+          !entry.isSqueezing
+        ) {
+          if (xrRefSpace && e.frame) {
+            updateSingleXrInputSource(source, e.frame, xrRefSpace);
+          }
+          finishVrCartridgeGrab();
+        }
+      }
+
+      function onXrFrame(now, xrFrame) {
+        const session = xrFrame.session;
+        if (!session || session !== xrSession) return;
+        session.requestAnimationFrame(onXrFrame);
+
+        if (!gl || !xrRefSpace) return;
+        const pose = xrFrame.getViewerPose(xrRefSpace);
+        if (!pose) return;
+
+        if (!vrStageCalibrated) {
+          vrStageOrigin = computeVrStageOrigin(
+            [pose.transform.position.x, pose.transform.position.y, pose.transform.position.z],
+            CONSOLE_SLOT_POS
+          );
+          vrStageCalibrated = true;
+        }
+
+        updateAllXrInputs(xrFrame, xrRefSpace);
+        const sim = stepSimulation(now);
+
+        const glLayer = session.renderState.baseLayer;
+        if (!glLayer) return;
+
+        mat4Identity(_xrWorldToStageMat);
+        _xrWorldToStageMat[0] = VR_WORLD_SCALE;
+        _xrWorldToStageMat[5] = VR_WORLD_SCALE;
+        _xrWorldToStageMat[10] = VR_WORLD_SCALE;
+        _xrWorldToStageMat[12] = vrStageOrigin[0];
+        _xrWorldToStageMat[13] = vrStageOrigin[1];
+        _xrWorldToStageMat[14] = vrStageOrigin[2];
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, glLayer.framebuffer);
+        gl.viewport(0, 0, glLayer.framebufferWidth, glLayer.framebufferHeight);
+        gl.clearColor(0.065, 0.07, 0.105, 1.0);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+        for (let v = 0; v < pose.views.length; v++) {
+          const view = pose.views[v];
+          const vp = glLayer.getViewport(view);
+          if (!vp) continue;
+          gl.viewport(vp.x, vp.y, vp.width, vp.height);
+
+          const ew = xrPointToSceneWorld(
+            [view.transform.position.x, view.transform.position.y, view.transform.position.z],
+            vrStageOrigin
+          );
+          _xrEyeWorld[0] = ew[0];
+          _xrEyeWorld[1] = ew[1];
+          _xrEyeWorld[2] = ew[2];
+
+          mat4Multiply(_xrScaledViewMat, view.transform.inverse.matrix, _xrWorldToStageMat);
+          mat4Multiply(_xrVpMat, view.projectionMatrix, _xrScaledViewMat);
+          renderScenePass(_xrVpMat, _xrEyeWorld, sim, true);
+        }
+      }
+
+      function syncXrButtonDom() {
+        if (state.xrSupported) {
+          if (!xrEnterBtnEl && deckActionsEl) {
+            xrEnterBtnEl = document.createElement('button');
+            xrEnterBtnEl.type = 'button';
+            xrEnterBtnEl.id = 'xr-session-btn';
+            xrEnterBtnEl.className = 'xr-mode-btn';
+            xrEnterBtnEl.addEventListener('click', toggleXrSession);
+            deckActionsEl.insertBefore(xrEnterBtnEl, ejectBtnEl);
+          }
+          if (xrEnterBtnEl) {
+            xrEnterBtnEl.hidden = false;
+            xrEnterBtnEl.classList.toggle('is-active', state.xrSessionActive);
+            xrEnterBtnEl.textContent = state.xrSessionActive ? 'Exit VR' : 'Enter VR';
+            xrEnterBtnEl.setAttribute(
+              'aria-label',
+              state.xrSessionActive ? 'Exit VR' : 'Enter VR'
+            );
+          }
+        } else if (!state.xrSessionActive && xrEnterBtnEl) {
+          xrEnterBtnEl.remove();
+          xrEnterBtnEl = null;
+        }
+      }
+
+      async function toggleXrSession() {
+        if (!navigator.xr || !gl) return;
+        if (xrSession) {
+          try {
+            await xrSession.end();
+          } catch (_e) {
+            // Ignore session close error
+          }
+          return;
+        }
+
+        getAudioContext();
+        try {
+          if (typeof gl.makeXRCompatible === 'function') {
+            try {
+              await gl.makeXRCompatible();
+            } catch (_compatErr) {
+              // Continue when using WebXR emulator/polyfill without native OS OpenXR driver
+            }
+          }
+          const session = await navigator.xr.requestSession('immersive-vr', {
+            optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking']
+          });
+
+          xrSession = session;
+          state.xrSessionActive = true;
+          vrStageCalibrated = false;
+          vrInputMap.clear();
+          vrControllerDrawStates.length = 0;
+
+          // Ensure all 14 cartridges are laid out in a comfortable 7x2 VR shelf grid
+          computeShelfLayout();
+          syncXrButtonDom();
+
+          session.updateRenderState({
+            baseLayer: new XRWebGLLayer(session, gl),
+            depthNear: 0.05,
+            depthFar: 40.0
+          });
+
+          try {
+            xrRefSpace = await session.requestReferenceSpace('local-floor');
+          } catch (_floorErr) {
+            xrRefSpace = await session.requestReferenceSpace('local');
+          }
+
+          session.addEventListener('selectstart', function (ev) {
+            handleXrGrabPress(ev, 'select');
+          });
+          session.addEventListener('selectend', function (ev) {
+            handleXrGrabRelease(ev, 'select');
+          });
+          session.addEventListener('squeezestart', function (ev) {
+            handleXrGrabPress(ev, 'squeeze');
+          });
+          session.addEventListener('squeezeend', function (ev) {
+            handleXrGrabRelease(ev, 'squeeze');
+          });
+
+          session.addEventListener('end', function () {
+            if (state.animMode === 'vr-holding') {
+              finishVrCartridgeGrab();
+            }
+            xrSession = null;
+            xrRefSpace = null;
+            state.xrSessionActive = false;
+            state.vrActiveInputSource = null;
+            vrInputMap.clear();
+            vrControllerDrawStates.length = 0;
+            if (gl) {
+              gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            }
+            if (state.animMode === 'idle' && !state.slottedGameId) {
+              consoleReadoutEl.textContent = 'Console Ready · Click or drag a cartridge to the slot';
+            }
+            syncXrButtonDom();
+            lastFrameTime = performance.now();
+            requestRender();
+          });
+
+          if (state.animMode === 'idle' && !state.slottedGameId) {
+            consoleReadoutEl.textContent = 'Console Ready · Grab a cartridge and put it in the slot';
+          }
+          lastFrameTime = performance.now();
+          session.requestAnimationFrame(onXrFrame);
+        } catch (_err) {
+          xrSession = null;
+          xrRefSpace = null;
+          state.xrSessionActive = false;
+          syncXrButtonDom();
+          requestRender();
+        }
+      }
+
+      function initWebXrSupport() {
+        if (
+          typeof navigator === 'undefined' ||
+          !navigator.xr ||
+          typeof navigator.xr.isSessionSupported !== 'function'
+        ) {
+          state.xrSupported = false;
+          syncXrButtonDom();
+          return;
+        }
+
+        const checkSupport = function () {
+          navigator.xr
+            .isSessionSupported('immersive-vr')
+            .then(function (supported) {
+              state.xrSupported = Boolean(supported);
+              syncXrButtonDom();
+            })
+            .catch(function () {
+              state.xrSupported = false;
+              syncXrButtonDom();
+            });
+        };
+
+        checkSupport();
+        if (typeof navigator.xr.addEventListener === 'function') {
+          navigator.xr.addEventListener('devicechange', checkSupport);
+        }
+      }
+
       // Boot 3D Scene & UI (synchronously project frame 0 so the very first cartridge grab has exact 3D matrices)
       initWebGL();
       renderCategoryBar();
@@ -4492,6 +5551,7 @@
       rebuildHitButtonsDOM();
       stepSimulationAndDraw(performance.now());
       requestRender();
+      initWebXrSupport();
 
       // Re-bake high-DPI cartridge label textures once Press Start 2P finishes loading
       if (document.fonts && document.fonts.ready) {
